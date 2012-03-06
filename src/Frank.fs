@@ -20,7 +20,6 @@ open System.Net.Http.Formatting
 open System.Net.Http.Headers
 open System.Text
 open FSharpx
-open FSharpx.Reader
 
 #if DEBUG
 open System.Json
@@ -54,104 +53,153 @@ type HttpApplication = HttpRequestMessage -> Async<HttpResponseMessage>
 
 // ## HTTP Response Header Combinators
 
-// Headers are added using the `Reader` monad. If F# allows mutation, why do we need the monad?
-// First of all, it allows for the explicit declaration of side effects. Second, a number
-// of combinators are already defined that allows you to more easily compose headers.
-type HttpResponseBuilder = Reader<HttpResponseMessage, unit>
-let respond statusCode builder = let response = new HttpResponseMessage(statusCode) in builder response; response
+// `HttpResponseMessage`s are mutable and not very compositional, so here we define a monad.
+// If F# allows mutation, why do we need the monad?
+// First of all, it allows for the explicit declaration of side effects.
+// Second, we can encapsulate state in such a way as to hide header collection access and let you dictate instead the functions to build the response.
+// Third, the computation expressions make a nice, convenient DSL.
+type HttpResponder<'a> = HttpResponseMessage -> 'a
+
+// Inline combinators for building responses. 
+let inline returnM x : HttpResponder<_> = fun _ -> x
+let inline (>>=) m k : HttpResponder<_> = fun r -> (k (m r)) r
+// Sequential application
+let inline (<*>) f m = f >>= fun f' -> m >>= fun m' -> returnM (f' m')
+let inline map f m = m >>= fun x -> returnM (f x)
+let inline lift2 f x y = returnM f <*> x <*> y
+// Sequence actions, discarding the value of the first argument.
+let inline ( *>) x y = lift2 (fun _ z -> z) x y
+// Sequence actions, discarding the value of the second argument.
+let inline ( <*) x y = lift2 (fun z _ -> z) x y
+// Sequentially compose two reader actions, discarding any value produced by the first
+let inline (>>.) m f = m >>= (fun _ -> f)
+// Left-to-right Kleisli composition
+let inline (>=>) f g = fun x -> f x >>= g
+// Right-to-left Kleisli composition
+let inline (<=<) x = flip (>=>) x
+let inline fold f s = Seq.fold (fun acc t -> acc >>= (flip f) t) (returnM s)
+let inline respondM statusCode builder = 
+  let response = new HttpResponseMessage(statusCode)
+  builder response
+  response
+
+// Computation expression for building responses.
+type HttpResponseBuilder(statusCode) =
+  member x.Return(a) = returnM a
+  member x.ReturnFrom(a) : HttpResponder<_> = a
+  member x.Bind(m, k) = m >>= k
+  member x.Zero() = returnM ()
+  member x.Combine(r1, r2) = r1 >>= fun () -> r2
+  member x.TryWith(m, h) : HttpResponder<_> =
+    fun env -> try m env
+               with e -> (h e) env
+  member x.TryFinally(m, compensation) : HttpResponder<_> =
+    fun env -> try m env
+               finally compensation()
+  member x.Using(res:#IDisposable, body) =
+    x.TryFinally(body res, (fun () -> match res with null -> () | disp -> disp.Dispose()))
+  member x.Delay(f) = returnM () >>= f
+  member x.While(guard, m) =
+    if not(guard()) then returnM ()
+    else m >>= fun () -> x.While(guard, m)
+  member x.For(sequence:seq<_>, body) =
+    x.Using(sequence.GetEnumerator(), (fun enum -> x.While(enum.MoveNext, x.Delay(fun () -> body enum.Current))))
+  member x.Run(m) = respondM statusCode m
+
+let respond statusCode = new HttpResponseBuilder(statusCode)
 
 // ### General Headers
-let Date x : HttpResponseBuilder =
+let Date x : HttpResponder<_> =
   fun response -> response.Headers.Date <- Nullable.create x
 
-let Connection x : HttpResponseBuilder =
+let Connection x : HttpResponder<_> =
   fun response -> response.Headers.Connection.ParseAdd x
 
-let Trailer x : HttpResponseBuilder =
+let Trailer x : HttpResponder<_> =
   fun response -> response.Headers.Trailer.ParseAdd x
 
-let ``Transfer-Encoding`` x : HttpResponseBuilder =
+let ``Transfer-Encoding`` x : HttpResponder<_> =
   fun response -> response.Headers.TransferEncoding.ParseAdd x
 
-let Upgrade x : HttpResponseBuilder =
+let Upgrade x : HttpResponder<_> =
   fun response -> response.Headers.Upgrade.ParseAdd x
 
-let Via x : HttpResponseBuilder =
+let Via x : HttpResponder<_> =
   fun response -> response.Headers.Via.ParseAdd x
 
-let ``Cache-Control`` x : HttpResponseBuilder =
+let ``Cache-Control`` x : HttpResponder<_> =
   fun response -> response.Headers.CacheControl <- CacheControlHeaderValue.Parse x
 
-let Pragma x : HttpResponseBuilder =
+let Pragma x : HttpResponder<_> =
   fun response -> response.Headers.Pragma.ParseAdd x
 
 // ### Response Headers
-let Age x : HttpResponseBuilder =
+let Age x : HttpResponder<_> =
   fun response -> response.Headers.Age <- Nullable.create x
 
-let ``Retry-After`` x : HttpResponseBuilder =
+let ``Retry-After`` x : HttpResponder<_> =
   fun response -> response.Headers.RetryAfter <- RetryConditionHeaderValue.Parse x
 
-let Server x : HttpResponseBuilder =
+let Server x : HttpResponder<_> =
   fun response -> response.Headers.Server.ParseAdd x
 
-let Warning x : HttpResponseBuilder =
+let Warning x : HttpResponder<_> =
   fun response -> response.Headers.Warning.ParseAdd x
 
-let ``Accept-Ranges`` x : HttpResponseBuilder =
+let ``Accept-Ranges`` x : HttpResponder<_> =
   fun response -> response.Headers.AcceptRanges.ParseAdd x
 
-let Vary x : HttpResponseBuilder =
+let Vary x : HttpResponder<_> =
   fun response -> response.Headers.Vary.ParseAdd x
 
-let ``Proxy-Authenticate`` x : HttpResponseBuilder =
+let ``Proxy-Authenticate`` x : HttpResponder<_> =
   fun response -> response.Headers.ProxyAuthenticate.ParseAdd x
 
-let ``WWW-Authenticate`` x : HttpResponseBuilder =
+let ``WWW-Authenticate`` x : HttpResponder<_> =
   fun response -> response.Headers.WwwAuthenticate.ParseAdd x
 
 // ### Entity Headers
-let Allow x : HttpResponseBuilder =
+let Allow x : HttpResponder<_> =
   fun response -> Seq.iter response.Content.Headers.Allow.Add x
 
-let Location x : HttpResponseBuilder =
+let Location x : HttpResponder<_> =
   fun response -> response.Headers.Location <- x
 
-let ``Content-Disposition`` x : HttpResponseBuilder =
+let ``Content-Disposition`` x : HttpResponder<_> =
   fun response -> response.Content.Headers.ContentDisposition <- ContentDispositionHeaderValue x
 
-let ``Content-Encoding`` x : HttpResponseBuilder =
+let ``Content-Encoding`` x : HttpResponder<_> =
   fun response -> Seq.iter response.Content.Headers.ContentEncoding.Add x
 
-let ``Content-Language`` x : HttpResponseBuilder =
+let ``Content-Language`` x : HttpResponder<_> =
   fun response -> Seq.iter response.Content.Headers.ContentLanguage.Add x 
 
-let ``Content-Length`` x : HttpResponseBuilder =
+let ``Content-Length`` x : HttpResponder<_> =
   fun response -> response.Content.Headers.ContentLength <- Nullable.create x
 
-let ``Content-Location`` x : HttpResponseBuilder =
+let ``Content-Location`` x : HttpResponder<_> =
   fun response -> response.Content.Headers.ContentLocation <- x
 
-let ``Content-MD5`` x : HttpResponseBuilder =
+let ``Content-MD5`` x : HttpResponder<_> =
   fun response -> response.Content.Headers.ContentMD5 <- x
 
-let ``Content-Range`` from _to length : HttpResponseBuilder =
+let ``Content-Range`` from _to length : HttpResponder<_> =
   fun response -> response.Content.Headers.ContentRange <- ContentRangeHeaderValue(from, _to, length)
 
-let ``Content-Type`` x : HttpResponseBuilder =
+let ``Content-Type`` x : HttpResponder<_> =
   fun response -> response.Content.Headers.ContentType <- MediaTypeHeaderValue x
 
-let ETag tag isWeak : HttpResponseBuilder =
+let ETag tag isWeak : HttpResponder<_> =
   fun response -> response.Headers.ETag <- EntityTagHeaderValue(tag, isWeak)
 
-let Expires x : HttpResponseBuilder =
+let Expires x : HttpResponder<_> =
   fun response -> response.Content.Headers.Expires <- Nullable.create x
 
-let ``Last Modified`` x : HttpResponseBuilder =
+let ``Last Modified`` x : HttpResponder<_> =
   fun response -> response.Content.Headers.LastModified <- Nullable.create x
 
 // ### Content
-let Body content : HttpResponseBuilder =
+let Body content : HttpResponder<_> =
   fun response -> response.Content <- content
 
 #if DEBUG
@@ -169,14 +217,14 @@ let ``test respond without body``() =
 [<Test>]
 let ``test respond with StringContent``() =
   let body = "Howdy"
-  let response = respond HttpStatusCode.OK <| Body (new StringContent(body))
+  let response = respond HttpStatusCode.OK { do! Body (new StringContent(body)) }
   test <@ response.StatusCode = HttpStatusCode.OK @>
   test <@ response.Content.ReadAsStringAsync().Result = body @>
 
 [<Test>]
 let ``test respond with negotiated body``() =
   let body = "Howdy"
-  let response = respond HttpStatusCode.OK <| Body (new SimpleObjectContent<_>(body, "text/plain", new XmlMediaTypeFormatter()))
+  let response = respond HttpStatusCode.OK { do! Body (new SimpleObjectContent<_>(body, "text/plain", new XmlMediaTypeFormatter())) }
   test <@ response.StatusCode = HttpStatusCode.OK @>
   test <@ response.Content.ReadAsStringAsync().Result = "<?xml version=\"1.0\" encoding=\"utf-8\"?><string>Howdy</string>" @>
 #endif
@@ -187,7 +235,7 @@ let ``test respond with negotiated body``() =
 // `respondWithAllowHeader` allows both methods to share common functionality.
 let internal respondWithAllowHeader statusCode allowedMethods body =
   fun _ -> async {
-    return respond statusCode <| Allow allowedMethods *> Body body }
+    return respondM statusCode <| Allow allowedMethods *> Body body }
 
 // `OPTIONS` responses should return the allowed methods, and this helper facilitates method calls.
 let options allowedMethods =
@@ -226,7 +274,7 @@ let ``test 405 Method Not Allowed``() =
 
 let ``406 Not Acceptable`` =
   fun _ -> async {
-    return respond HttpStatusCode.NotAcceptable <| Body (new StringContent("406 Not Acceptable")) }
+    return respondM HttpStatusCode.NotAcceptable <| Body (new StringContent("406 Not Acceptable")) }
 
 #if DEBUG
 [<Test>]
@@ -317,7 +365,7 @@ let runConneg formatters (f: HttpRequestMessage -> Async<_>) =
         async {
           let! responseBody = f request
           let formattedBody = responseBody |> formatWith mediaType formatter
-          return respond HttpStatusCode.OK <| ``Content-Type`` mediaType *> ``Vary`` "Accept" *> Body formattedBody }
+          return respondM HttpStatusCode.OK <| ``Content-Type`` mediaType *> ``Vary`` "Accept" *> Body formattedBody }
     | _ -> ``406 Not Acceptable`` request
 
 // ## HTTP Resources
@@ -394,14 +442,14 @@ let routeTemplatedResource uriTemplate uriMatcher handlers =
 
 let ``404 Not Found`` : HttpApplication =
   fun request -> async {
-    return respond HttpStatusCode.NotFound <| Body (new StringContent("404 Not Found")) }
+    return respondM HttpStatusCode.NotFound <| Body (new StringContent("404 Not Found")) }
 
 let findApplicationFor resources (request: HttpRequestMessage) =
   let resource = Seq.tryFind (fun (r: HttpResource) -> r.IsIdentifiedBy request) resources
   resource |> Option.map (fun r -> r.Invoke)
 
 #if DEBUG
-let stub request = async { return respond HttpStatusCode.OK ignore }
+let stub request = async { return respondM HttpStatusCode.OK ignore }
 let resource1 = route "/" (get stub <|> post stub)
 let resource2 = route "/stub" <| get stub
 
